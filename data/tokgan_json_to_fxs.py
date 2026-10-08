@@ -5,28 +5,40 @@ This converter transforms vector shape data from the Tokgan JSON format
 to Silhouette FXS format, handling the coordinate system differences.
 
 Usage:
-    python json_to_fxs.py input.json [output.fxs] [--log]
+    python tokgan_json_to_fxs.py input.json [output.fxs] [--log] [--layers]
+                                 [--frame-offset N] [--no-hierarchy]
 
 Arguments:
     input.json    Path to input JSON file (required)
     output.fxs    Path to output FXS file (optional, defaults to input.fxs)
 
-Options:
-    --log         Log execution details for each shape
+Layouts:
+    v3 JSON (camera + persons blocks, Rotobot Next 0.10.0+) -> the camera /
+        person / body-part HIERARCHY by default:
+            camera        root Layer; its corner pin is the plate camera (the
+                          exact ECC homography), keyed every frame
+              p<N>        Layer per person; position keyed at the pelvis
+                <part>    Layer per body part; position + rotation from the
+                          bone; its shape's path is in bone-local units
+        so an artist can stabilise (disable the camera transform), move a
+        whole person, or adjust one limb. --no-hierarchy for the old layouts.
+    --layers   person -> region -> side grouping, transforms unused
+    default    flat list of shapes (v2, or --no-hierarchy without --layers)
 
-Coordinate Systems:
-- Tokgan JSON: Pixel coordinates with (0,0) at bottom-left (Nuke-style)
-- Silhouette FXS: Normalized coordinates (0.5 height = 1.0 unit)
-  - Origin is at center of canvas
-  - Y increases upward
-  - X range is roughly -0.5 to 0.5 (adjusted by pixel aspect)
-
-The conversion uses the inverse of Silhouette's ImagetoWorldTransform:
-  normalized_x = ((pixel_x - w/2) / h) * pixel_aspect
-  normalized_y = ((h - pixel_y) - h/2) / h
+Coordinate systems (checked in Silhouette, 2026-10-08):
+- Tokgan JSON: pixels, (0,0) at the TOP-left, Y down.
+- Silhouette FXS shapes and layer positions: origin at the image centre,
+  Y down, 1.0 = image height:
+      normalized_x = ((pixel_x - w/2) / h) * pixel_aspect
+      normalized_y = (pixel_y - h/2) / h
+- Layer corner pin: fractions of the image, (0,0) top-left, (1,1)
+  bottom-right. Layer rotation: degrees, positive clockwise on screen.
+  A parent layer's transform (pin included) carries down to its children.
 """
 
 import json
+import math
+import os
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -38,6 +50,11 @@ from collections import defaultdict
 WIDTH = 2160
 HEIGHT = 4096
 PIXEL_ASPECT = 1.0
+# Silhouette frame = JSON frame + FRAME_OFFSET. JSON frames are 1-indexed. Default -1 maps
+# them to a 0-indexed Silhouette timeline (historical behaviour); pass --frame-offset 0 when
+# the footage in Silhouette is 1-indexed (EXR/mp4 sequences numbered from 1) so the shapes
+# line up with the plate instead of landing one frame early.
+FRAME_OFFSET = -1
 
 
 def pixels_to_silhouette_normalized(x, y):
@@ -225,7 +242,7 @@ def create_opacity_xml(visibility_data):
         return '<Property id="opacity"><Value>0</Value></Property>'
 
     # Get sorted Silhouette frame numbers (JSON - 1)
-    sorted_frames = [f - 1 for f in sorted_json_frames]
+    sorted_frames = [f + FRAME_OFFSET for f in sorted_json_frames]
 
     opacity_lines = ['<Property id="opacity">']
     keyframes = []
@@ -249,7 +266,13 @@ def create_opacity_xml(visibility_data):
 
     # Generate keyframes for each segment
     for seg_start, seg_end in segments:
-        # Invisible→Visible transition at segment start
+        # Invisible→Visible transition at segment start. The "off" key must sit exactly
+        # one frame BEFORE the "on" key so hold interpolation reads invisible up to the
+        # boundary. Use a fixed -1 gap (NOT FRAME_OFFSET): seg_start is already
+        # offset-adjusted, so reusing FRAME_OFFSET here double-applied it and, at
+        # --frame-offset 0, collapsed both keys onto the same frame (dropping the "off"
+        # and leaving shapes visible from frame 1). -1 == the old seg_start+FRAME_OFFSET
+        # when FRAME_OFFSET==-1, so the default path is unchanged.
         keyframes.append((seg_start - 1, 0))
         keyframes.append((seg_start, 100))
 
@@ -570,7 +593,7 @@ def create_silhouette_xml(data, log=False, use_layers=False):
 
         for frame_str in sorted_frames:
             # Silhouette frames start at 0, JSON frames start at 1
-            frame_num = int(frame_str) - 1
+            frame_num = int(frame_str) + FRAME_OFFSET
             frame_data = points_list[frame_str]
             pts = frame_data.get("points", [])
 
@@ -793,7 +816,7 @@ def create_silhouette_xml(data, log=False, use_layers=False):
         # Build root XML with layers
         xml_lines = [
             f'<!-- Silhouette Shape File -->',
-            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame-1}" workRangeEnd="{end_frame-1}" sessionStartFrame="1">',
+            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame+FRAME_OFFSET}" workRangeEnd="{end_frame+FRAME_OFFSET}" sessionStartFrame="1">',
         ]
 
         for layer_xml in person_layer_objects:
@@ -804,7 +827,7 @@ def create_silhouette_xml(data, log=False, use_layers=False):
         # Build root XML without layers (shapes directly under Silhouette)
         xml_lines = [
             f'<!-- Silhouette Shape File -->',
-            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame-1}" workRangeEnd="{end_frame-1}" sessionStartFrame="1">',
+            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame+FRAME_OFFSET}" workRangeEnd="{end_frame+FRAME_OFFSET}" sessionStartFrame="1">',
         ]
 
         for shape_xml in shape_elements:
@@ -814,6 +837,167 @@ def create_silhouette_xml(data, log=False, use_layers=False):
         xml_lines.append("</Silhouette>")
 
     return "\n".join(xml_lines), shape_count, total_frames
+
+
+# ----------------------------------------------------------------- hierarchy
+# v3 camera / person / body-part layers. The decomposition is rotobot-nuke's,
+# vendored beside this file as _rotobot_hierarchy (see its VENDORED.txt).
+
+
+def has_reference_frames(data):
+    """True for a v3 JSON that carries the camera or persons blocks."""
+    return bool(data.get("camera") or data.get("persons"))
+
+
+def _hierarchy_modules():
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from _rotobot_hierarchy import hierarchy, reader
+    return reader, hierarchy
+
+
+def _v2(x, y):
+    return f"({x:.9f},{y:.9f})"
+
+
+def _const(pid, value, extra=""):
+    return f'<Property id="{pid}" constant="True"{extra}><Value>{value}</Value></Property>'
+
+
+def _keyed(pid, frame_values):
+    keys = "".join(f'<Key frame="{f + FRAME_OFFSET}" interp="linear">{v}</Key>'
+                   for f, v in frame_values)
+    return f'<Property id="{pid}">{keys}</Property>'
+
+
+def _layer_xml(tag, obj_id, label, overrides, children):
+    """A Silhouette layer with the full transform property set Silhouette
+    writes itself; `overrides` replaces any of them with keyed versions."""
+    props = {
+        "transform.anchor": _const("transform.anchor", _v2(0, 0)),
+        "transform.position": _const("transform.position", _v2(0, 0)),
+        "transform.rotate": _const("transform.rotate", "0"),
+        "transform.pin_ul": _const("transform.pin_ul", _v2(0, 0)),
+        "transform.pin_ur": _const("transform.pin_ur", _v2(1, 0)),
+        "transform.pin_lr": _const("transform.pin_lr", _v2(1, 1)),
+        "transform.pin_ll": _const("transform.pin_ll", _v2(0, 1)),
+    }
+    props.update(overrides)
+    body = [
+        '<Property id="note" constant="True"></Property>',
+        _const("color", "(1.000000,1.000000,1.000000)"),
+        _const("transform", ""),
+        props["transform.anchor"], props["transform.position"],
+        _const("transform.scale", "(1.000000000,1.000000000,1.000000000)", ' gang="True"'),
+        props["transform.rotate"],
+        _const("transform.pin", ""),
+        props["transform.pin_ul"], props["transform.pin_ur"],
+        props["transform.pin_lr"], props["transform.pin_ll"],
+        _const("transform.surface", ""),
+        _const("transform.surface_ul", _v2(0, 0)), _const("transform.surface_ur", _v2(1, 0)),
+        _const("transform.surface_lr", _v2(1, 1)), _const("transform.surface_ll", _v2(0, 1)),
+        _const("transform.matrix", ""),
+        '<Property id="stereoOffset"><Value>(0.000000000,0.000000000,0.000000000)</Value></Property>',
+        '<Property id="trackSource"><Value>0</Value></Property>',
+        '<Property id="objects" expanded="True" constant="True">' + "".join(children) + "</Property>",
+    ]
+    uuid = generate_uuid(f"hier_layer_{label}_{obj_id}")
+    return (f'<{tag} type="Layer" id="{obj_id}" label="{label}" expanded="True" uuid="{uuid}">'
+            f'<Properties>{"".join(body)}</Properties></{tag}>')
+
+
+def create_silhouette_hierarchy_xml(data, log=False):
+    """The camera / person / body-part .fxs for a v3 JSON.
+
+    Returns (xml, shape_count, frame_count) like create_silhouette_xml. Raises
+    ValueError when the hierarchy would not reproduce the source: every
+    vertex is recomposed through camera, person and part before anything is
+    written, and the worst error must be within the core's tolerance.
+    """
+    import io
+    reader, hier_mod = _hierarchy_modules()
+    global WIDTH, HEIGHT
+    res = data.get("resolution") or [WIDTH, HEIGHT]
+    WIDTH, HEIGHT = int(res[0]), int(res[1])
+    W, H = WIDTH, HEIGHT
+
+    doc = reader.load_json(io.StringIO(json.dumps(data)))
+    h = hier_mod.decompose(doc)
+    err = hier_mod.round_trip_error(doc, h)
+    if err > hier_mod.ROUND_TRIP_TOLERANCE_PX:
+        raise ValueError(
+            f"camera/person hierarchy does not reproduce the source shapes "
+            f"(worst {err:.3f} px > {hier_mod.ROUND_TRIP_TOLERANCE_PX} px)")
+    if log:
+        print(f"hierarchy: {len(h.pids)} person(s), {len(h.parts)} parts, "
+              f"round-trip {err:.2e} px, {len(h.held)} held frame(s)")
+        for note in h.held:
+            print(f"  held: {note}")
+
+    next_id = iter(range(1, 10 ** 9))
+    persons = []
+    frame_count = 0
+    for pid in h.pids:
+        parts = []
+        for key in sorted(k for k in h.parts if h.person_of[k] == pid):
+            obj = data["objects"][key]
+            keys = []
+            for f in sorted(h.knots[key]):
+                pts = h.knots[key][f]
+                if not pts:
+                    continue
+                # Bone-local pixels -> layer units: scale by 1/height only;
+                # the part layer's position is the origin.
+                pxml = "".join(
+                    f'<Point left="{_v2(q.left_x / H, q.left_y / H)}" '
+                    f'right="{_v2(q.right_x / H, q.right_y / H)}">{_v2(q.x / H, q.y / H)}</Point>'
+                    for q in pts)
+                keys.append(f'<Key frame="{f + FRAME_OFFSET}" interp="linear">'
+                            f'<Path closed="True" type="Bspline">{pxml}</Path></Key>')
+            frame_count = max(frame_count, len(keys))
+            sid = next(next_id)
+            label = key.replace(":", "_")
+            shape = (f'<Object type="Shape" id="{sid}" label="{label}Shape" expanded="True" '
+                     f'uuid="{generate_uuid(sid)}" shape_type="Bspline"><Properties>'
+                     f'<Property id="note" constant="True"></Property>'
+                     f'<Property id="path">{"".join(keys)}</Property>'
+                     f'{create_opacity_xml(obj.get("visibility", {}))}</Properties></Object>')
+            xf = sorted(h.parts[key].items())
+            parts.append(_layer_xml("Object", next(next_id), label, {
+                "transform.position": _keyed("transform.position",
+                                             [(f, _v2(x.tx / H, x.ty / H)) for f, x in xf]),
+                # Degrees, positive clockwise on screen -- the same sense as
+                # the core's Y-down angle, so no sign change.
+                "transform.rotate": _keyed("transform.rotate",
+                                           [(f, f"{x.angle:.6f}") for f, x in xf]),
+            }, [shape]))
+        pel = [(f, _v2((x - W / 2) / H, (y - H / 2) / H)) for f, (x, y) in sorted(h.pelvis[pid].items())]
+        persons.append(_layer_xml("Object", next(next_id), f"p{pid}",
+                                  {"transform.position": _keyed("transform.position", pel)}, parts))
+
+    # The camera: the plate corners through each frame's homography, as
+    # fractions of the image. A four-corner pin is a projective map, so this
+    # is the homography exactly, and the pin carries down to every child.
+    pins = {c: [] for c in ("ul", "ur", "lr", "ll")}
+    for f in h.frames:
+        m = h.camera[f]
+        for c, (x, y) in zip(("ul", "ur", "lr", "ll"), ((0, 0), (W, 0), (W, H), (0, H))):
+            px, py = hier_mod.apply_h(m, x, y)
+            pins[c].append((f, _v2(px / W, py / H)))
+    camera = _layer_xml("Layer", 0, "camera",
+                        {f"transform.pin_{c}": _keyed(f"transform.pin_{c}", v) for c, v in pins.items()},
+                        persons)
+
+    xml = "\n".join([
+        "<!-- Silhouette Shape File -->",
+        f'<Silhouette width="{W}" height="{H}" pixelAspect="1" '
+        f'workRangeStart="{h.frames[0] + FRAME_OFFSET}" workRangeEnd="{h.frames[-1] + FRAME_OFFSET}" '
+        f'sessionStartFrame="1">',
+        camera,
+        "</Silhouette>",
+    ]) + "\n"
+    return xml, len(h.parts), frame_count
 
 
 def main():
@@ -830,12 +1014,31 @@ def main():
     if layers_enabled:
         args.remove("--layers")
 
+    # v3 JSONs build the camera / person / part hierarchy unless told not to.
+    no_hierarchy = "--no-hierarchy" in args
+    if no_hierarchy:
+        args.remove("--no-hierarchy")
+
+    # --frame-offset N : Silhouette frame = JSON frame + N (default -1). Use 0 for
+    # 1-indexed footage so shapes align with the plate instead of landing one frame early.
+    global FRAME_OFFSET
+    if "--frame-offset" in args:
+        i = args.index("--frame-offset")
+        try:
+            FRAME_OFFSET = int(args[i + 1])
+        except (IndexError, ValueError):
+            print("Error: --frame-offset requires an integer (e.g. --frame-offset 0)")
+            sys.exit(1)
+        del args[i:i + 2]
+
     if len(args) < 1:
-        print("Usage: python json_to_fxs.py input.json [output.fxs] [--log] [--layers]")
+        print("Usage: python tokgan_json_to_fxs.py input.json [output.fxs] [--log] [--layers] [--frame-offset N] [--no-hierarchy]")
         print("")
         print("Options:")
-        print("  --log      Log execution details for each shape")
-        print("  --layers   Create hierarchical layer structure from object names")
+        print("  --log            Log execution details for each shape")
+        print("  --layers         Group shapes person -> region -> side (no transforms)")
+        print("  --no-hierarchy   For a v3 JSON, skip the camera / person / part hierarchy")
+        print("  --frame-offset N Silhouette frame = JSON frame + N (default -1; use 0 for 1-indexed footage)")
         sys.exit(1)
 
     input_path = args[0]
@@ -862,7 +1065,11 @@ def main():
 
     start_time = time.time()
 
-    xml_output, shape_count, frame_count = create_silhouette_xml(data, log=log_enabled, use_layers=layers_enabled)
+    hierarchy = has_reference_frames(data) and not no_hierarchy
+    if hierarchy:
+        xml_output, shape_count, frame_count = create_silhouette_hierarchy_xml(data, log=log_enabled)
+    else:
+        xml_output, shape_count, frame_count = create_silhouette_xml(data, log=log_enabled, use_layers=layers_enabled)
 
     with open(output_path, "w") as f:
         f.write(xml_output)
@@ -872,8 +1079,10 @@ def main():
     print(f"Converted {input_path} to {output_path}")
     print(f"Resolution: {WIDTH}x{HEIGHT}, Pixel Aspect: {PIXEL_ASPECT}")
     print(f"Shapes: {shape_count}, Frames per shape: {frame_count}")
-    if layers_enabled:
-        print("Layer structure: Hierarchical (person -> region -> side -> part)")
+    if hierarchy:
+        print("Layer structure: camera (corner pin) -> person -> body part, transforms keyed")
+    elif layers_enabled:
+        print("Layer structure: person -> region -> side")
     print(f"Time elapsed: {elapsed:.2f} seconds")
 
 

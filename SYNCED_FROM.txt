@@ -1,0 +1,8 @@
+# data/tokgan_json_to_fxs.py, data/_rotobot_hierarchy/ and
+# tokgan_silhouette_import_hierachy.py are copies of the Silhouette
+# integration shipped with Rotobot Next. Change them there, then re-sync.
+repo    https://github.com/samhodge-tokgan/Rotobot-Next
+commit  3e112c24b8897ebf20e95362df3e0b45ee8a77b7  (feat(silhouette): v3 camera / person / body-part layer hierarchy, #290)
+path    packaging/integrations/silhouette/
+# data/_rotobot_hierarchy/ is itself vendored from rotobot-nuke; its
+# VENDORED.txt names the exact commit.
