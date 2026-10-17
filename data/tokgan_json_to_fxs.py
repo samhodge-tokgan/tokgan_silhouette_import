@@ -108,6 +108,63 @@ def create_point_xml(x, y, left_x=None, left_y=None, right_x=None, right_y=None)
     return f"<Point>{point_str}</Point>"
 
 
+#: Silhouette shape type written for every path. "Xspline" (default) with a per-point shape weight of
+#: XSPLINE_WEIGHT = -1 passes THROUGH each knot -- the knots lie on the matte edge, and the JSON's
+#: splines interpolate them. "Bspline" is the historical output: Silhouette evaluates it as a uniform
+#: cubic B-spline whose curve passes only NEAR the points ((C[i-1] + 4 C[i] + C[i+1]) / 6), ~10% inside
+#: an 8-point circle, so shapes pulled in at every convex bend and left notches at joints. Both measured
+#: in Silhouette 2025.5 through its own importer (ShapePath.evalPoint), 2026-10-17.
+SPLINE_TYPE = "Xspline"
+XSPLINE_WEIGHT = -1.0
+
+#: Objects carrying fitted B-spline CONTROL POINTS ("spline": "bspline3_uniform_closed", per-frame "cps")
+#: are written as native Silhouette B-splines from those control points, weight 1: Silhouette evaluates
+#: a closed uniform cubic B-spline (measured: 8-point circle r=200 draws at 180.47), which is exactly the
+#: curve that was fitted -- and exactly what the JSON's points + handles describe as Bezier.
+CONTROL_POINT_SPLINE = "bspline3_uniform_closed"
+_CUR_TYPE = None          # the shape type of the object being written (None: SPLINE_TYPE)
+
+
+def _cur_type():
+    return _CUR_TYPE or SPLINE_TYPE
+
+
+def use_control_points(data):
+    """-> (data with each fitted object's control points in place of its points, {names written as
+    Bspline}). Control points pass through the camera / person / part decomposition exactly as curve
+    points do (it is affine per frame), so the hierarchy and its round-trip gates apply unchanged."""
+    names = {n for n, o in data.get("objects", {}).items()
+             if o.get("spline") == CONTROL_POINT_SPLINE
+             and all(fr.get("cps") for fr in o.get("frames", {}).values())}
+    if not names:
+        return data, names
+    out = dict(data)
+    out["objects"] = dict(data["objects"])
+    for n in names:
+        o = dict(data["objects"][n])
+        o["frames"] = {f: dict(fr, points=[{"x": c["x"], "y": c["y"], "left_x": c["x"], "left_y": c["y"],
+                                            "right_x": c["x"], "right_y": c["y"]} for c in fr["cps"]])
+                       for f, fr in o["frames"].items()}
+        o["point_count"] = len(next(iter(o["frames"].values()))["points"])
+        out["objects"][n] = o
+    return out, names
+
+
+def _point_xml(x, y, left=None, right=None):
+    """One <Point> for the current SPLINE_TYPE: an X-spline point carries its shape weight; a B-spline
+    point carries the JSON handles (historical; Silhouette ignores them for B-splines)."""
+    if _cur_type() == "Xspline":
+        return f'<Point weight="{XSPLINE_WEIGHT:g}">({x:.6f},{y:.6f})</Point>'
+    if _CUR_TYPE == "Bspline":
+        return f"<Point>({x:.6f},{y:.6f})</Point>"
+    attrs = ""
+    if left is not None:
+        attrs += f' left="({left[0]:.6f},{left[1]:.6f})"'
+    if right is not None:
+        attrs += f' right="({right[0]:.6f},{right[1]:.6f})"'
+    return f"<Point{attrs}>({x:.6f},{y:.6f})</Point>"
+
+
 def create_path_xml(points, closed=True):
     """
     Create a Path XML element with points.
@@ -120,7 +177,7 @@ def create_path_xml(points, closed=True):
         XML string for the Path element
     """
     path_lines = []
-    path_lines.append('\t\t\t\t<Path closed="True" type="Bspline">')
+    path_lines.append(f'\t\t\t\t<Path closed="True" type="{_cur_type()}">')
 
     for pt in points:
         x, y = pixels_to_silhouette_normalized(pt["x"], pt["y"])
@@ -132,7 +189,8 @@ def create_path_xml(points, closed=True):
         if "right_x" in pt:
             right_x, right_y = pixels_to_silhouette_normalized(pt["right_x"], pt["right_y"])
 
-        point_xml = create_point_xml(x, y, left_x, left_y, right_x, right_y)
+        point_xml = (_point_xml(x, y) if (_cur_type() == "Xspline" or _CUR_TYPE == "Bspline")
+                     else create_point_xml(x, y, left_x, left_y, right_x, right_y))
         path_lines.append("\t\t\t\t\t" + point_xml)
 
     path_lines.append("\t\t\t\t</Path>")
@@ -183,7 +241,7 @@ def create_shape_xml_with_opacity(label, shape_id, keys_xml, opacity_xml, closed
     """
     # Use tab indentation like original FXS files
     lines = [
-        f'\t<Shape type="Shape" id="{shape_id}" label="{label}" selected="True" expanded="True" uuid="{generate_uuid(shape_id)}" shape_type="Bspline">',
+        f'\t<Shape type="Shape" id="{shape_id}" label="{label}" selected="True" expanded="True" uuid="{generate_uuid(shape_id)}" shape_type="{_cur_type()}">',
         "\t\t<Properties>",
         "\t\t\t<Property id=\"note\" constant=\"True\"></Property>",
         "\t\t\t<Property id=\"path\">",
@@ -424,6 +482,12 @@ def create_layer_xml(label, contents, indent="\t", obj_id=0):
     return create_object_xml("Layer", label, obj_id, uuid, objects_content, indent)
 
 
+def _shape_type_of(shape_xml):
+    import re
+    m = re.search(r'shape_type="([A-Za-z]+)"', shape_xml)
+    return m.group(1) if m else SPLINE_TYPE
+
+
 def create_shape_object_xml(label, shape_xml, obj_id):
     """
     Create a Shape Object XML element wrapped in <Object type="Shape">.
@@ -439,7 +503,7 @@ def create_shape_object_xml(label, shape_xml, obj_id):
     uuid = generate_uuid(f"shape_{label}_{obj_id}")
 
     lines = [
-        f'\t\t\t\t\t<Object type="Shape" id="{obj_id}" label="{label}" uuid="{uuid}" shape_type="Bspline">',
+        f'\t\t\t\t\t<Object type="Shape" id="{obj_id}" label="{label}" uuid="{uuid}" shape_type="{_shape_type_of(shape_xml)}">',
     ]
     # Extract the properties from the shape_xml
     # Shape XML has <Properties>...</Properties> section
@@ -577,8 +641,11 @@ def create_silhouette_xml(data, log=False, use_layers=False):
         hierarchy = build_layer_hierarchy(data)
 
     # Build shape XML (used both with and without layers)
+    global _CUR_TYPE
+    data, cp_names = use_control_points(data)
     shapes_by_name = {}
     for obj_name, obj in data.get("objects", {}).items():
+        _CUR_TYPE = "Bspline" if obj_name in cp_names else None
         points_list = obj.get("frames", {})
         closed = obj.get("closed", True)
         visibility_data = obj.get("visibility", {})
@@ -615,6 +682,8 @@ def create_silhouette_xml(data, log=False, use_layers=False):
                 print(f"[Shape {shape_count}] {label}: {len(sorted_frames)} frames, {len(pts)} points per frame     ", end="\r", flush=True)
 
 
+
+    _CUR_TYPE = None
 
     # Calculate total frames across all shapes
     total_frames = len(set(int(f) for obj in data.get("objects", {}).values() for f in obj.get("frames", {}).keys()))
@@ -865,10 +934,63 @@ def _const(pid, value, extra=""):
     return f'<Property id="{pid}" constant="True"{extra}><Value>{value}</Value></Property>'
 
 
+def _frame(t):
+    """A key time: integral frames as before, sub-frame keys to 6 places."""
+    t += FRAME_OFFSET
+    return str(int(t)) if t == int(t) else f"{t:.6f}".rstrip("0")
+
+
 def _keyed(pid, frame_values):
-    keys = "".join(f'<Key frame="{f + FRAME_OFFSET}" interp="linear">{v}</Key>'
-                   for f, v in frame_values)
+    """Keys from (frame, value) or (frame, value, interp); interp defaults to linear."""
+    keys = "".join(f'<Key frame="{_frame(fv[0])}" '
+                   f'interp="{fv[2] if len(fv) > 2 else "linear"}">{fv[1]}</Key>'
+                   for fv in frame_values)
     return f'<Property id="{pid}">{keys}</Property>'
+
+
+#: Silhouette's .fxs importer clamps rotation keys to +/-360 (2025.5.3: a key
+#: of 1000 imports as 360). The layer itself does not -- set from Python it
+#: keeps 1178.7 -- so the clamp is the importer's alone. A spinning limb
+#: unwraps well past it: a breakdance windmill's calf reached 1178 deg.
+SILHOUETTE_ROTATE_LIMIT = 360.0
+#: The width of a wrap, in frames. The importer keeps sub-frame key times.
+_WRAP_DT = 1e-3
+
+
+def _rotate_keys(series):
+    """[(frame, PartXform)] with unwrapped angles -> [(time, "deg", interp)],
+    every value inside +/-SILHOUETTE_ROTATE_LIMIT, one curve, no extra layers.
+
+    Where the true angle crosses +/-360 between two keys, a key goes in AT
+    the crossing (+/-360, hold) and another _WRAP_DT later, one turn back,
+    on the same line. The integral keys and every segment between them
+    are unchanged, so frames, scrubbing and motion blur see the true
+    rotation; only the _WRAP_DT step holds, an error of at most
+    speed * _WRAP_DT (0.13 deg at the windmill's fastest 127 deg/frame).
+    """
+    lim = SILHOUETTE_ROTATE_LIMIT
+    out = []
+    offset = 0.0
+    prev = None
+    for f, x in series:
+        a = x.angle
+        if prev is not None:
+            f0, a0 = prev
+            while abs(a - offset) > lim:
+                edge = lim if a - offset > lim else -lim
+                tc = f0 + (offset + edge - a0) / (a - a0) * (f - f0)
+                if out and abs(out[-1][0] - tc) < 1e-9:
+                    out[-1] = (out[-1][0], out[-1][1], "hold")
+                else:
+                    out.append((tc, f"{edge:.6f}", "hold"))
+                offset += math.copysign(360.0, edge)
+                ta = tc + _WRAP_DT
+                if ta < f:
+                    va = a0 + (a - a0) * (ta - f0) / (f - f0) - offset
+                    out.append((ta, f"{va:.6f}", "linear"))
+        out.append((f, f"{a - offset:.6f}", "linear"))
+        prev = (f, a)
+    return out
 
 
 def _layer_xml(tag, obj_id, label, overrides, children):
@@ -907,6 +1029,22 @@ def _layer_xml(tag, obj_id, label, overrides, children):
             f'<Properties>{"".join(body)}</Properties></{tag}>')
 
 
+def _emitted_round_trip_error(doc, h, hier_mod, rotate):
+    """round_trip_error, but with each part's rotation as Silhouette's
+    importer reads it back: the written string at each frame, clamped to
+    +/-SILHOUETTE_ROTATE_LIMIT. The core's check proves the decomposition;
+    this proves what was written."""
+    import copy
+    lim = SILHOUETTE_ROTATE_LIMIT
+    he = copy.copy(h)
+    he.parts = {}
+    for key, series in h.parts.items():
+        at = {t: v for t, v, _ in rotate[key]}
+        he.parts[key] = {f: hier_mod.PartXform(x.tx, x.ty, max(-lim, min(lim, float(at[f]))))
+                         for f, x in series.items()}
+    return hier_mod.round_trip_error(doc, he)
+
+
 def create_silhouette_hierarchy_xml(data, log=False):
     """The camera / person / body-part .fxs for a v3 JSON.
 
@@ -922,6 +1060,7 @@ def create_silhouette_hierarchy_xml(data, log=False):
     WIDTH, HEIGHT = int(res[0]), int(res[1])
     W, H = WIDTH, HEIGHT
 
+    data, cp_names = use_control_points(data)
     doc = reader.load_json(io.StringIO(json.dumps(data)))
     h = hier_mod.decompose(doc)
     err = hier_mod.round_trip_error(doc, h)
@@ -934,6 +1073,17 @@ def create_silhouette_hierarchy_xml(data, log=False):
               f"round-trip {err:.2e} px, {len(h.held)} held frame(s)")
         for note in h.held:
             print(f"  held: {note}")
+
+    rotate = {key: _rotate_keys(sorted(series.items())) for key, series in h.parts.items()}
+    emitted = _emitted_round_trip_error(doc, h, hier_mod, rotate)
+    if emitted > hier_mod.ROUND_TRIP_TOLERANCE_PX:
+        raise ValueError(
+            f"the written rotations do not reproduce the source shapes in Silhouette "
+            f"(worst {emitted:.3f} px > {hier_mod.ROUND_TRIP_TOLERANCE_PX} px)")
+    if log:
+        wraps = sum(i == "hold" for keys in rotate.values() for _, _, i in keys)
+        print(f"rotation: {wraps} sub-frame wrap(s) to stay within "
+              f"+/-{SILHOUETTE_ROTATE_LIMIT:g} deg, as read back {emitted:.2e} px")
 
     next_id = iter(range(1, 10 ** 9))
     persons = []
@@ -949,17 +1099,24 @@ def create_silhouette_hierarchy_xml(data, log=False):
                     continue
                 # Bone-local pixels -> layer units: scale by 1/height only;
                 # the part layer's position is the origin.
-                pxml = "".join(
-                    f'<Point left="{_v2(q.left_x / H, q.left_y / H)}" '
-                    f'right="{_v2(q.right_x / H, q.right_y / H)}">{_v2(q.x / H, q.y / H)}</Point>'
-                    for q in pts)
+                stype = "Bspline" if key in cp_names else SPLINE_TYPE
+                if stype == "Bspline" and key in cp_names:
+                    pxml = "".join(f'<Point>{_v2(q.x / H, q.y / H)}</Point>' for q in pts)
+                elif stype == "Xspline":
+                    pxml = "".join(f'<Point weight="{XSPLINE_WEIGHT:g}">{_v2(q.x / H, q.y / H)}</Point>'
+                                   for q in pts)
+                else:
+                    pxml = "".join(
+                        f'<Point left="{_v2(q.left_x / H, q.left_y / H)}" '
+                        f'right="{_v2(q.right_x / H, q.right_y / H)}">{_v2(q.x / H, q.y / H)}</Point>'
+                        for q in pts)
                 keys.append(f'<Key frame="{f + FRAME_OFFSET}" interp="linear">'
-                            f'<Path closed="True" type="Bspline">{pxml}</Path></Key>')
+                            f'<Path closed="True" type="{stype}">{pxml}</Path></Key>')
             frame_count = max(frame_count, len(keys))
             sid = next(next_id)
             label = key.replace(":", "_")
             shape = (f'<Object type="Shape" id="{sid}" label="{label}Shape" expanded="True" '
-                     f'uuid="{generate_uuid(sid)}" shape_type="Bspline"><Properties>'
+                     f'uuid="{generate_uuid(sid)}" shape_type="{"Bspline" if key in cp_names else SPLINE_TYPE}"><Properties>'
                      f'<Property id="note" constant="True"></Property>'
                      f'<Property id="path">{"".join(keys)}</Property>'
                      f'{create_opacity_xml(obj.get("visibility", {}))}</Properties></Object>')
@@ -969,8 +1126,8 @@ def create_silhouette_hierarchy_xml(data, log=False):
                                              [(f, _v2(x.tx / H, x.ty / H)) for f, x in xf]),
                 # Degrees, positive clockwise on screen -- the same sense as
                 # the core's Y-down angle, so no sign change.
-                "transform.rotate": _keyed("transform.rotate",
-                                           [(f, f"{x.angle:.6f}") for f, x in xf]),
+                # Wrapped at sub-frame keys for Silhouette's importer.
+                "transform.rotate": _keyed("transform.rotate", rotate[key]),
             }, [shape]))
         pel = [(f, _v2((x - W / 2) / H, (y - H / 2) / H)) for f, (x, y) in sorted(h.pelvis[pid].items())]
         persons.append(_layer_xml("Object", next(next_id), f"p{pid}",
@@ -1019,6 +1176,17 @@ def main():
     if no_hierarchy:
         args.remove("--no-hierarchy")
 
+    # --spline xspline|bspline : shape type (default xspline: curves pass through the knots).
+    global SPLINE_TYPE
+    if "--spline" in args:
+        i = args.index("--spline")
+        try:
+            SPLINE_TYPE = {"xspline": "Xspline", "bspline": "Bspline"}[args[i + 1].lower()]
+        except (IndexError, KeyError):
+            print("Error: --spline requires xspline or bspline")
+            sys.exit(1)
+        del args[i:i + 2]
+
     # --frame-offset N : Silhouette frame = JSON frame + N (default -1). Use 0 for
     # 1-indexed footage so shapes align with the plate instead of landing one frame early.
     global FRAME_OFFSET
@@ -1032,13 +1200,14 @@ def main():
         del args[i:i + 2]
 
     if len(args) < 1:
-        print("Usage: python tokgan_json_to_fxs.py input.json [output.fxs] [--log] [--layers] [--frame-offset N] [--no-hierarchy]")
+        print("Usage: python tokgan_json_to_fxs.py input.json [output.fxs] [--log] [--layers] [--frame-offset N] [--no-hierarchy] [--spline xspline|bspline]")
         print("")
         print("Options:")
         print("  --log            Log execution details for each shape")
         print("  --layers         Group shapes person -> region -> side (no transforms)")
         print("  --no-hierarchy   For a v3 JSON, skip the camera / person / part hierarchy")
         print("  --frame-offset N Silhouette frame = JSON frame + N (default -1; use 0 for 1-indexed footage)")
+        print("  --spline TYPE    xspline (default; curves pass through the knots) or bspline (historical)")
         sys.exit(1)
 
     input_path = args[0]
