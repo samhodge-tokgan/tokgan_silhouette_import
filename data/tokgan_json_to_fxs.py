@@ -36,6 +36,7 @@ Coordinate systems (checked in Silhouette, 2026-10-08):
   A parent layer's transform (pin included) carries down to its children.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -50,11 +51,72 @@ from collections import defaultdict
 WIDTH = 2160
 HEIGHT = 4096
 PIXEL_ASPECT = 1.0
-# Silhouette frame = JSON frame + FRAME_OFFSET. JSON frames are 1-indexed. Default -1 maps
-# them to a 0-indexed Silhouette timeline (historical behaviour); pass --frame-offset 0 when
-# the footage in Silhouette is 1-indexed (EXR/mp4 sequences numbered from 1) so the shapes
-# line up with the plate instead of landing one frame early.
+# Key = JSON frame + FRAME_OFFSET. JSON frames are 1-indexed. Default -1, which the
+# measurement below shows is right on any session made from the plate. (It used to say "use
+# 0 for footage numbered from 1"; on such a session 0 lands every shape one frame late.)
+#
+# MEASURED (Silhouette 2026.0.4, headless sfxcmd renders, 2026-10-22): a <Key frame> is a time
+# RELATIVE TO THE SESSION START, not a frame number. A session made from a plate starts at
+# the plate's first number (977 for shot.0977.exr), and key t draws on frame start + t:
+#   plate 977..979, keys 0,1,2   -> JSON frames 1,2,3 on 977,978,979   (right)
+#   plate 977..979, keys 977..   -> nothing on 977..979                 (they sit at 1954..)
+#   plate 1..3,     keys 1,2,3   -> frame 1 empty, JSON 1 on frame 2   (a frame late)
+# so on a session made from the plate, JSON frame k is key k-1 whatever the plate is called.
+#
+# That is the rule for a JSON with `frame_start`: keys from 0 (offset -1), and
+# sessionStartFrame = frame_start so a session made FROM the .fxs header numbers its frames
+# like the plate. FRAME_OFFSET is ignored there -- the Queue writes its Settings value into
+# it on every export, and that setting answers a question this JSON already answers. Only
+# an explicit --frame-offset on this CLI (FRAME_OFFSET_FROM_CLI) still wins.
 FRAME_OFFSET = -1
+FRAME_OFFSET_FROM_CLI = False
+# The <Silhouette sessionStartFrame> written: "1" (historical) unless the JSON's own numbering
+# is in effect. Set per conversion by _numbered_as(); read by the writers. The header has no
+# frame-rate attribute, so the JSON's fps is not written.
+_SESSION_START = 1
+# Added to a key to give the header's work range, which Silhouette keeps in DISPLAY frames
+# (a 977 session reports workRange (977, ...)). 0 for older JSON, whose header has always
+# carried key numbers there; frame_start for a source-numbered one.
+_WORK_SHIFT = 0
+
+
+def _frame_start(data):
+    """The JSON's `frame_start` (source frame of JSON frame 1), or None when it has none or
+    it is not a usable frame number -- a malformed value falls back to today's numbering
+    rather than throwing every key somewhere unexpected."""
+    fs = data.get("frame_start")
+    if (isinstance(fs, bool) or not isinstance(fs, (int, float)) or not math.isfinite(fs)
+            or fs != int(fs) or fs < 0):
+        return None
+    return int(fs)
+
+
+def frame_numbering(data):
+    """-> (offset, sessionStartFrame, work-range shift) for this JSON: see FRAME_OFFSET above.
+
+    With `frame_start`, keys count from the session start (offset -1) and the session starts
+    at frame_start -- the plate's first frame, not the first keyed one, so a person who walks
+    in on frame 30 still lines up. Without it, or with an explicit --frame-offset, this is
+    exactly the old output.
+    """
+    fs = _frame_start(data)
+    if FRAME_OFFSET_FROM_CLI or fs is None:
+        return FRAME_OFFSET, 1, 0
+    return -1, fs, fs
+
+
+@contextlib.contextmanager
+def _numbered_as(data):
+    """FRAME_OFFSET / _SESSION_START set for `data` for the length of one conversion, then put
+    back: every writer below reads the globals, and the Queue's setting must survive a shot
+    that happened to override it."""
+    global FRAME_OFFSET, _SESSION_START, _WORK_SHIFT
+    saved = FRAME_OFFSET, _SESSION_START, _WORK_SHIFT
+    FRAME_OFFSET, _SESSION_START, _WORK_SHIFT = frame_numbering(data)
+    try:
+        yield
+    finally:
+        FRAME_OFFSET, _SESSION_START, _WORK_SHIFT = saved
 
 
 def pixels_to_silhouette_normalized(x, y):
@@ -608,7 +670,8 @@ def create_layer_object_xml(label, content_objects, obj_id):
 
 def create_silhouette_xml(data, log=False, use_layers=False):
     """
-    Create the complete Silhouette XML structure.
+    Create the complete Silhouette XML structure, keyed on the JSON's source frame numbers
+    when it carries `frame_start` (see frame_numbering).
 
     Args:
         data: Parsed JSON data
@@ -618,6 +681,11 @@ def create_silhouette_xml(data, log=False, use_layers=False):
     Returns:
         Tuple of (formatted XML string, shape count, frame count)
     """
+    with _numbered_as(data):
+        return _create_silhouette_xml(data, log, use_layers)
+
+
+def _create_silhouette_xml(data, log, use_layers):
     global WIDTH, HEIGHT, PIXEL_ASPECT
     WIDTH, HEIGHT = data.get("resolution", [2160, 4096])
     PIXEL_ASPECT = data.get("pixelAspect", 1.0)
@@ -885,7 +953,7 @@ def create_silhouette_xml(data, log=False, use_layers=False):
         # Build root XML with layers
         xml_lines = [
             f'<!-- Silhouette Shape File -->',
-            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame+FRAME_OFFSET}" workRangeEnd="{end_frame+FRAME_OFFSET}" sessionStartFrame="1">',
+            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame+FRAME_OFFSET+_WORK_SHIFT}" workRangeEnd="{end_frame+FRAME_OFFSET+_WORK_SHIFT}" sessionStartFrame="{_SESSION_START}">',
         ]
 
         for layer_xml in person_layer_objects:
@@ -896,7 +964,7 @@ def create_silhouette_xml(data, log=False, use_layers=False):
         # Build root XML without layers (shapes directly under Silhouette)
         xml_lines = [
             f'<!-- Silhouette Shape File -->',
-            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame+FRAME_OFFSET}" workRangeEnd="{end_frame+FRAME_OFFSET}" sessionStartFrame="1">',
+            f'<Silhouette width="{WIDTH}" height="{HEIGHT}" pixelAspect="1" workRangeStart="{start_frame+FRAME_OFFSET+_WORK_SHIFT}" workRangeEnd="{end_frame+FRAME_OFFSET+_WORK_SHIFT}" sessionStartFrame="{_SESSION_START}">',
         ]
 
         for shape_xml in shape_elements:
@@ -1052,7 +1120,13 @@ def create_silhouette_hierarchy_xml(data, log=False):
     ValueError when the hierarchy would not reproduce the source: every
     vertex is recomposed through camera, person and part before anything is
     written, and the worst error must be within the core's tolerance.
+    Keys land on source frame numbers when the JSON has `frame_start`.
     """
+    with _numbered_as(data):
+        return _create_silhouette_hierarchy_xml(data, log)
+
+
+def _create_silhouette_hierarchy_xml(data, log):
     import io
     reader, hier_mod = _hierarchy_modules()
     global WIDTH, HEIGHT
@@ -1149,8 +1223,9 @@ def create_silhouette_hierarchy_xml(data, log=False):
     xml = "\n".join([
         "<!-- Silhouette Shape File -->",
         f'<Silhouette width="{W}" height="{H}" pixelAspect="1" '
-        f'workRangeStart="{h.frames[0] + FRAME_OFFSET}" workRangeEnd="{h.frames[-1] + FRAME_OFFSET}" '
-        f'sessionStartFrame="1">',
+        f'workRangeStart="{h.frames[0] + FRAME_OFFSET + _WORK_SHIFT}" '
+        f'workRangeEnd="{h.frames[-1] + FRAME_OFFSET + _WORK_SHIFT}" '
+        f'sessionStartFrame="{_SESSION_START}">',
         camera,
         "</Silhouette>",
     ]) + "\n"
@@ -1189,11 +1264,13 @@ def main():
 
     # --frame-offset N : Silhouette frame = JSON frame + N (default -1). Use 0 for
     # 1-indexed footage so shapes align with the plate instead of landing one frame early.
-    global FRAME_OFFSET
+    # Given here it beats the JSON's own frame_start too (FRAME_OFFSET_FROM_CLI).
+    global FRAME_OFFSET, FRAME_OFFSET_FROM_CLI
     if "--frame-offset" in args:
         i = args.index("--frame-offset")
         try:
             FRAME_OFFSET = int(args[i + 1])
+            FRAME_OFFSET_FROM_CLI = True
         except (IndexError, ValueError):
             print("Error: --frame-offset requires an integer (e.g. --frame-offset 0)")
             sys.exit(1)
@@ -1206,7 +1283,9 @@ def main():
         print("  --log            Log execution details for each shape")
         print("  --layers         Group shapes person -> region -> side (no transforms)")
         print("  --no-hierarchy   For a v3 JSON, skip the camera / person / part hierarchy")
-        print("  --frame-offset N Silhouette frame = JSON frame + N (default -1; use 0 for 1-indexed footage)")
+        print("  --frame-offset N key = JSON frame + N; keys count from the session start (default -1).")
+        print("                   A JSON with frame_start always uses -1 and starts the session there,")
+        print("                   unless this is given.")
         print("  --spline TYPE    xspline (default; curves pass through the knots) or bspline (historical)")
         sys.exit(1)
 
