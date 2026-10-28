@@ -170,6 +170,13 @@ def create_point_xml(x, y, left_x=None, left_y=None, right_x=None, right_y=None)
     return f"<Point>{point_str}</Point>"
 
 
+#: Camera ``source`` the engine writes on every frame of a shot whose background
+#: moves by itself (water, foliage): no camera move was tracked, and each frame
+#: holds the identity.
+NONRIGID = "ecc-nonrigid"
+NONRIGID_NOTE = ("camera not usable (the background moves by itself, e.g. water; "
+                 "no camera move to track): built without the camera")
+
 #: Silhouette shape type written for every path. "Xspline" (default) with a per-point shape weight of
 #: XSPLINE_WEIGHT = -1 passes THROUGH each knot -- the knots lie on the matte edge, and the JSON's
 #: splines interpolate them. "Bspline" is the historical output: Silhouette evaluates it as a uniform
@@ -1136,6 +1143,9 @@ def _create_silhouette_hierarchy_xml(data, log):
 
     data, cp_names = use_control_points(data)
     doc = reader.load_json(io.StringIO(json.dumps(data)))
+    nonrigid = bool(doc.camera) and any((c.source or "") == NONRIGID for c in doc.camera.values())
+    if nonrigid:
+        doc.camera = None  # identity on every frame: no camera layer at all
     h = hier_mod.decompose(doc)
     err = hier_mod.round_trip_error(doc, h)
     if err > hier_mod.ROUND_TRIP_TOLERANCE_PX:
@@ -1145,6 +1155,8 @@ def _create_silhouette_hierarchy_xml(data, log):
     if log:
         print(f"hierarchy: {len(h.pids)} person(s), {len(h.parts)} parts, "
               f"round-trip {err:.2e} px, {len(h.held)} held frame(s)")
+        if nonrigid:
+            print(f"  note: {NONRIGID_NOTE}")
         for note in h.held:
             print(f"  held: {note}")
 
