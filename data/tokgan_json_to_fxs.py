@@ -1185,7 +1185,11 @@ def _create_silhouette_hierarchy_xml(data, log):
     frame_count = 0
     for pid in h.pids:
         parts = []
-        for key in sorted(k for k in h.parts if h.person_of[k] == pid):
+        # Reverse document order, not alphabetical. The engine lists each person's hands first so they sit over
+        # the legs and torso (#527), and Nuke and After Effects stack the FIRST object on top. Silhouette
+        # composites a layer's children in file order, so its LAST child is on top (probed in Silhouette 2025.5:
+        # a Subtract shape removes the matte only when it is written last), hence reversed.
+        for key in reversed([k for k in data["objects"] if k in h.parts and h.person_of[k] == pid]):
             obj = data["objects"][key]
             keys = []
             for f in sorted(h.knots[key]):

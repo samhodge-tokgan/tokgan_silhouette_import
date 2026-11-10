@@ -2,4 +2,4 @@
 # Change them there, then re-sync (packaging/ci/sync-downstream-dcc.sh); Rotobot-Next CI fails if they
 # are edited here (packaging/ci/check-downstream-dcc-sync.sh).
 repo    https://github.com/samhodge-tokgan/Rotobot-Next
-commit  8e48360fca78bbfcccef0a31804233aa9a080435  (Exports turn on host shape motion blur: Nuke, Silhouette (#443, #524 G1) (#533))
+commit  4b8e11f67da8830bf3ae866b2e21307edf1ec164  (C11.1: hands in front of the body keep their own shape and sit on top (#527) (#534))
