@@ -294,6 +294,14 @@ def create_property_xml(keys_xml):
     return '<Property id="path">\n' + "\n".join(keys_xml) + "\n\t\t\t\t</Property>"
 
 
+# Shape motion blur (#443). Silhouette blurs a shape only when BOTH the Roto node's Motion Blur is enabled
+# AND the shape's own motionBlur flag is set; a shape imported without the flag has it off, so turning on
+# the node's blur did nothing for our shapes. Every shape is written with the flag on (the element is the
+# one Silhouette 2026.0.4's own "Silhouette Shapes" export writes); the node's Motion Blur switch (with
+# its shutter angle / phase / samples) stays the artist's single control.
+MOTION_BLUR_XML = '<Property id="motionBlur" constant="True"><Value>true</Value></Property>'
+
+
 def create_shape_xml_with_opacity(label, shape_id, keys_xml, opacity_xml, closed=True):
     """
     Create a Silhouette Shape element with animation keys and opacity property.
@@ -323,6 +331,7 @@ def create_shape_xml_with_opacity(label, shape_id, keys_xml, opacity_xml, closed
 
     lines.append("\t\t\t</Property>")
     lines.append(opacity_xml)
+    lines.append(MOTION_BLUR_XML)
     lines.append("\t\t</Properties>")
     lines.append("\t</Shape>")
 
@@ -1205,7 +1214,7 @@ def _create_silhouette_hierarchy_xml(data, log):
                      f'uuid="{generate_uuid(sid)}" shape_type="{"Bspline" if key in cp_names else SPLINE_TYPE}"><Properties>'
                      f'<Property id="note" constant="True"></Property>'
                      f'<Property id="path">{"".join(keys)}</Property>'
-                     f'{create_opacity_xml(obj.get("visibility", {}))}</Properties></Object>')
+                     f'{create_opacity_xml(obj.get("visibility", {}))}{MOTION_BLUR_XML}</Properties></Object>')
             xf = sorted(h.parts[key].items())
             parts.append(_layer_xml("Object", next(next_id), label, {
                 "transform.position": _keyed("transform.position",
